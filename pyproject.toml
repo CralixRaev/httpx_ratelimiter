@@ -16,6 +16,9 @@ dependencies = [
 ]
 dynamic = ["version", "description"]
 
+[project.urls]
+Home = "https://github.com/CralixRaev/httpx_ratelimiter"
+
 [project.optional-dependencies]
 dev = ["pre-commit"]
 
