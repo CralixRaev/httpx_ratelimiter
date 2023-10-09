@@ -16,7 +16,7 @@ documentation
 
 Example:
 
-```pycon
+```py
 from time import time
 
 from httpx import Client

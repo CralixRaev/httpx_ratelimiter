@@ -1,5 +1,5 @@
 [project]
-requires-python = ">3.7"
+requires-python = ">3.9"
 name = "httpx_ratelimiter"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -12,7 +12,7 @@ keywords = ["httpx", "rate-limiting", "leaky-bucket"]
 authors = [{ name = "Anatoly Raev", email = "cralixraev@gmail.com" }]
 dependencies = [
     "httpx",
-    "pyrate-limiter~=2.8.0"
+    "pyrate-limiter~=3.1.0"
 ]
 dynamic = ["version", "description"]
 
@@ -23,15 +23,18 @@ Home = "https://github.com/CralixRaev/httpx_ratelimiter"
 dev = ["pre-commit"]
 
 [tool.black]
-target-versions = ["py311"]
+target-versions = ["py39"]
 
 [tool.ruff]
 select = ["E", "F", "RUF", "PERF", "TRY", "PL", "PTH", "ARG", "SIM", "PIE", "C4",
     "B", "S", "UP", "C90", "A", "T20", "FURB"]
 preview = true
 
-target-version = "py311"
+target-version = "py39"
 
 [build-system]
 requires = ["flit_core >=3.2,<4"]
 build-backend = "flit_core.buildapi"
+
+[tool.flit.sdist]
+include = ["README.md"]

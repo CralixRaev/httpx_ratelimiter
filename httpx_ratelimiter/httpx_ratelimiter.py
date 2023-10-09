@@ -1,17 +1,69 @@
 from inspect import signature
 from logging import getLogger
-from time import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
+from collections.abc import Awaitable
 from collections.abc import Callable, Iterable
 from uuid import uuid4
 
 from httpx import BaseTransport, Response, Request, HTTPTransport
-from pyrate_limiter import Duration, Limiter, RequestRate
-from pyrate_limiter.bucket import AbstractBucket, MemoryListBucket, MemoryQueueBucket
-
+from pyrate_limiter import (
+    AbstractBucket,
+    InMemoryBucket,
+    Limiter,
+    Rate,
+    Duration,
+    BucketFactory,
+    RateItem,
+    AbstractClock,
+    TimeClock,
+)
 
 MIXIN_BASE = BaseTransport if TYPE_CHECKING else object
 logger = getLogger(__name__)
+
+
+class NameBucketFactory(BucketFactory):
+    """Bucket factory, that will move items based on their name"""
+
+    DEFAULT_NAME = "httpx_ratelimiter"
+
+    def __init__(  # noqa: PLR0913
+        self,
+        rates: list[Rate],
+        default_name: str,
+        clock: type[AbstractClock] = TimeClock,
+        bucket_class: type[AbstractBucket] = InMemoryBucket,
+        bucket_kwargs: dict | None = None,
+        *args,
+        **kwargs,
+    ):
+        self.default_name = default_name
+        self.clock = clock()
+        self.bucket_class = bucket_class
+        self.bucket_kwargs = bucket_kwargs
+        if self.bucket_kwargs is None:
+            self.bucket_kwargs = {}
+        self.rates = rates
+        self.buckets = {
+            self.default_name: self.create(
+                self.clock, self.bucket_class, rates=self.rates, **self.bucket_kwargs
+            )
+        }
+        super().__init__(*args, **kwargs)
+
+    def wrap_item(
+        self, name: str, weight: int = 1
+    ) -> Union[RateItem, Awaitable[RateItem]]:
+        now = self.clock.now()
+        return RateItem(name, now, weight)
+
+    def get(self, item: RateItem) -> AbstractBucket:
+        name = item.name
+        if name not in self.buckets:
+            self.buckets[name] = self.create(
+                self.clock, self.bucket_class, rates=self.rates, **self.bucket_kwargs
+            )
+        return self.buckets[name]
 
 
 class LimiterMixin(MIXIN_BASE):
@@ -28,73 +80,62 @@ class LimiterMixin(MIXIN_BASE):
         per_day: float = 0,
         per_month: float = 0,
         burst: float = 1,
-        bucket_class: type[AbstractBucket] = MemoryListBucket,
+        bucket_class: type[AbstractBucket] = InMemoryBucket,
         bucket_kwargs: dict | None = None,
-        time_function: Callable[..., float] | None = None,
+        bucket_factory: type[BucketFactory] = NameBucketFactory,
         limiter: Limiter | None = None,
-        max_delay: int | (float | None) = None,
+        raise_when_fail: bool = True,
+        max_delay: Union[int, float, None] = None,
+        clock: type[AbstractClock] = TimeClock,
         per_host: bool = True,
         limit_statuses: Iterable[int] = (429,),
         **kwargs,
     ):
-        # Translate request rate values into RequestRate objects
+        # Translate request rate values into Rate objects
         rates = [
-            RequestRate(limit, interval)
-            for interval, limit in {
-                Duration.SECOND * burst: per_second * burst,
-                Duration.MINUTE: per_minute,
-                Duration.HOUR: per_hour,
-                Duration.DAY: per_day,
-                Duration.MONTH: per_month,
-            }.items()
+            Rate(limit, interval)
+            for interval, limit in [
+                (Duration.SECOND * burst, per_second * burst),
+                (Duration.MINUTE, per_minute),
+                (Duration.HOUR, per_hour),
+                (Duration.DAY, per_day),
+                (Duration.WEEK * 4, per_month),
+            ]
             if limit
         ]
-
-        # If using a persistent backend, we don't want to use monotonic time
-        # (the default)
-        if (
-            bucket_class not in (MemoryListBucket, MemoryQueueBucket)
-            and not time_function
-        ):
-            time_function = time
-
-        self.limiter = limiter or Limiter(
-            *rates,
-            bucket_class=bucket_class,
-            bucket_kwargs=bucket_kwargs,
-            time_function=time_function,
-        )
+        self.default_name = str(uuid4())
         self.limit_statuses = limit_statuses
         self.max_delay = max_delay
         self.per_host = per_host
-        self._default_bucket = str(uuid4())
+        self.bucket_factory = bucket_factory(
+            rates, self.default_name, clock, bucket_class, bucket_kwargs
+        )
+        # create limiter object
+        self.limiter = limiter or Limiter(
+            self.bucket_factory, raise_when_fail=raise_when_fail, max_delay=max_delay
+        )
 
-        # If the superclass is an adapter or custom Session,
+        # If the superclass is an BaseTransport subclass,
         # pass along any valid keyword arguments
         session_kwargs = get_valid_kwargs(super().__init__, kwargs)
         super().__init__(**session_kwargs)  # type: ignore
-        # Base Session doesn't take any kwargs
 
     def handle_request(self, request: Request, **kwargs) -> Response:
         """Send a request with rate-limiting.
 
         Raises:
-            :py:exc:`.BucketFullException` if this request would result in a delay
-            longer than ``max_delay``
+            :py:exc:`.BucketFullException` if raise_when_fail is ``True`` and this
+                request would result in a delay longer than ``max_delay``
         """
-        with self.limiter.ratelimit(
-            self._bucket_name(request),
-            delay=True,
-            max_delay=self.max_delay,
-        ):
-            response = super().handle_request(request, **kwargs)
-            if response.status_code in self.limit_statuses:
-                self._fill_bucket(request)
-            return response
+        self.limiter.try_acquire(self._name(request))
+        response = super().handle_request(request, **kwargs)
+        if response.status_code in self.limit_statuses:
+            self._fill_bucket(request)
+        return response
 
-    def _bucket_name(self, request: Request):
-        """Get a bucket name for the given request"""
-        return request.url.netloc if self.per_host else self._default_bucket
+    def _name(self, request: Request):
+        """Get a name for the given request"""
+        return request.url.netloc if self.per_host else self.default_name
 
     def _fill_bucket(self, request: Request):
         """Partially fill the bucket for the given request, requiring an extra delay
@@ -113,22 +154,15 @@ class LimiterMixin(MIXIN_BASE):
         1-minute intervals.
         """
         logger.info(f"Rate limit exceeded for {request.url}; filling limiter bucket")
-        bucket = self.limiter.bucket_group[self._bucket_name(request)]
+        item = self.bucket_factory.wrap_item(self._name(request))
+        bucket = self.bucket_factory.get(item)
 
-        # Determine how many requests we've
-        # made within the smallest defined time interval
-        now = self.limiter.time_function()
-        rate = self.limiter._rates[0]
-        item_count, _ = bucket.inspect_expired_items(now - rate.interval)
-
-        # TODO: After fixing usage with MemoryQueueBucket on py 3.11,
-        #  don't add items over capacity
-        # capacity = bucket.maxsize() - bucket.size()
-        # n_filler_requests = min(capacity, rate.limit - item_count)
+        # Determine how many filler request we should add to reach a limit
+        rate = bucket.rates[0]
+        item_count = rate.limit - bucket.count()
 
         # Add "filler" requests to reach the limit for that interval
-        for _ in range(rate.limit - item_count):
-            bucket.put(now)
+        bucket.put(self.bucket_factory.wrap_item(self._name(request), item_count))
 
 
 class LimiterTransport(LimiterMixin, HTTPTransport):
@@ -155,9 +189,13 @@ class LimiterTransport(LimiterMixin, HTTPTransport):
             :py:class:`~pyrate_limiter.sqlite_bucket.SQLiteBucket`, or
             :py:class:`~pyrate_limiter.bucket.RedisBucket`
         bucket_kwargs: Bucket backend keyword arguments
+        bucket_factory: Bucket Factory class
+        raise_when_fail: Raise an exception. Read max_delay documentation for more
+            information
         limiter: An existing Limiter object to use instead of the above params
         max_delay: The maximum allowed delay time (in seconds); anything over this will
-            abort the request and raise a :py:exc:`.BucketFullException`
+            abort the request and raise a :py:exc:`.BucketFullException` if
+            raise_when_fail is `True`
         per_host: Track request rate limits separately for each host
         limit_statuses: Alternative HTTP status codes that indicate a rate limit was
             exceeded
