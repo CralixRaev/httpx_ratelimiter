@@ -25,7 +25,7 @@ with Client(transport=LimiterTransport(per_second=5, max_delay=600)) as c:
             f'[t + {time() - start: .2f}] got response: {c.get("https://httpbin.org/status/200,429")}'
         )
 ```
-##### Using custom limiter object
+##### Using custom list of rates
 ```py
 from time import time
 
@@ -37,8 +37,7 @@ from pyrate_limiter import Limiter, Rate, Duration
 # limit 5 requests over 2 seconds and 10 requests over 1 minute
 rates = [Rate(5, Duration.SECOND * 2), Rate(10, Duration.MINUTE)]
 # if wait time between request will be more than 600ms, silently fail
-limiter = Limiter(rates, max_delay=600, raise_when_fail=False)
-with Client(transport=LimiterTransport(limiter=limiter)) as c:
+with Client(transport=LimiterTransport(rates=rates, max_delay=600, raise_when_fail=False)) as c:
     start = time()
     for _i in range(100):
         print(

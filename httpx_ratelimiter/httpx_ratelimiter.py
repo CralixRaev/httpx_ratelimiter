@@ -80,6 +80,7 @@ class LimiterMixin(MIXIN_BASE):
         per_day: float = 0,
         per_month: float = 0,
         burst: float = 1,
+        rates: Rate | list[Rate] = None,
         bucket_class: type[AbstractBucket] = InMemoryBucket,
         bucket_kwargs: dict | None = None,
         bucket_factory: type[BucketFactory] = NameBucketFactory,
@@ -91,8 +92,10 @@ class LimiterMixin(MIXIN_BASE):
         limit_statuses: Iterable[int] = (429,),
         **kwargs,
     ):
+        if rates is None:
+            rates = []
         # Translate request rate values into Rate objects
-        rates = [
+        per_rates = [
             Rate(limit, interval)
             for interval, limit in [
                 (Duration.SECOND * burst, per_second * burst),
@@ -103,6 +106,7 @@ class LimiterMixin(MIXIN_BASE):
             ]
             if limit
         ]
+        rates += per_rates
         self.default_name = str(uuid4())
         self.limit_statuses = limit_statuses
         self.max_delay = max_delay
